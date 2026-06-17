@@ -106,9 +106,20 @@ export default function Home() {
     let loaded = 0;
     const checkLoaded = () => {
       loaded++;
+      console.log(`MediaPipe script loaded (${loaded}/${scripts.length})`);
       if (loaded === scripts.length) {
+        console.log('All MediaPipe scripts loaded. Checking globals...');
+        console.log('window.Pose:', typeof window.Pose);
+        console.log('window.Camera:', typeof window.Camera);
+        console.log('window.POSE_CONNECTIONS:', typeof window.POSE_CONNECTIONS);
+        console.log('window.drawConnectors:', typeof window.drawConnectors);
+        console.log('window.drawLandmarks:', typeof window.drawLandmarks);
         setMediapipeLoaded(true);
       }
+    };
+
+    const onError = (src) => (e) => {
+      console.error(`Failed to load script: ${src}`, e);
     };
 
     scripts.forEach((src) => {
@@ -116,6 +127,7 @@ export default function Home() {
       script.src = src;
       script.async = true;
       script.onload = checkLoaded;
+      script.onerror = onError(src);
       document.head.appendChild(script);
     });
   }, []);
@@ -124,10 +136,15 @@ export default function Home() {
   useEffect(() => {
     const videoElement = videoRef.current;
     const canvasElement = canvasRef.current;
-    if (!videoElement || !canvasElement || !mediapipeLoaded) return;
+    if (!videoElement || !canvasElement || !mediapipeLoaded) {
+      if (mediapipeLoaded) {
+        console.log('Waiting for DOM elements...');
+      }
+      return;
+    }
 
+    console.log('Starting Pose initialization...');
     const canvasCtx = canvasElement.getContext('2d');
-    let cameraInstance = null;
     let poseInstance = null;
     let isMounted = true;
 
@@ -135,18 +152,24 @@ export default function Home() {
       if (!isMounted) return;
       canvasCtx.save();
       canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
-      canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+      if (results.image) {
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+      }
 
-      if (results.poseLandmarks) {
-        window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, {
-          color: '#38bdf8',
-          lineWidth: 2
-        });
-        window.drawLandmarks(canvasCtx, results.poseLandmarks, {
-          color: '#0f172a',
-          lineWidth: 2,
-          radius: 1.5
-        });
+      if (results.poseLandmarks && results.poseLandmarks.length > 0) {
+        if (window.drawConnectors && window.POSE_CONNECTIONS) {
+          window.drawConnectors(canvasCtx, results.poseLandmarks, window.POSE_CONNECTIONS, {
+            color: '#38bdf8',
+            lineWidth: 2
+          });
+        }
+        if (window.drawLandmarks) {
+          window.drawLandmarks(canvasCtx, results.poseLandmarks, {
+            color: '#0f172a',
+            lineWidth: 2,
+            radius: 1.5
+          });
+        }
 
         const posture = computePostureScore(results.poseLandmarks);
         setScore(posture.score);
@@ -179,41 +202,72 @@ export default function Home() {
       canvasCtx.restore();
     };
 
-    const initPose = () => {
-      const Pose = window.Pose;
-      const Camera = window.Camera;
+    const initPose = async () => {
+      try {
+        const Pose = window.Pose;
 
-      if (!Pose || !Camera) {
-        console.error('MediaPipe not loaded');
-        return;
+        if (!Pose) {
+          console.error('MediaPipe Pose not loaded');
+          return;
+        }
+
+        console.log('Creating Pose instance...');
+        poseInstance = new Pose({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+        });
+        poseInstance.setOptions({
+          modelComplexity: 1,
+          smoothLandmarks: true,
+          enableSegmentation: false,
+          minDetectionConfidence: 0.5,
+          minTrackingConfidence: 0.5
+        });
+        poseInstance.onResults(onResults);
+
+        console.log('Requesting camera access...');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 640, height: 480 }
+        });
+
+        videoElement.srcObject = stream;
+        videoElement.muted = true;
+        videoElement.playsInline = true;
+        console.log('Camera stream attached to video element');
+
+        videoElement.onloadedmetadata = async () => {
+          console.log('Video metadata loaded', { readyState: videoElement.readyState });
+          try {
+            await videoElement.play();
+            console.log('Video playback started', { paused: videoElement.paused, readyState: videoElement.readyState });
+          } catch (playError) {
+            console.error('Error starting video playback', playError);
+          }
+          const sendFrame = async () => {
+            if (!isMounted) return;
+            if (videoElement.readyState >= 2) {
+              await poseInstance.send({ image: videoElement });
+            }
+            requestAnimationFrame(sendFrame);
+          };
+          sendFrame();
+        };
+      } catch (err) {
+        console.error('Error initializing Pose:', err);
       }
-
-      poseInstance = new Pose({
-        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
-      });
-      poseInstance.setOptions({
-        modelComplexity: 1,
-        smoothLandmarks: true,
-        enableSegmentation: false,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5
-      });
-      poseInstance.onResults(onResults);
-
-      cameraInstance = new Camera(videoElement, {
-        onFrame: async () => await poseInstance.send({ image: videoElement }),
-        width: 640,
-        height: 480
-      });
-      cameraInstance.start();
     };
 
     initPose();
 
     return () => {
       isMounted = false;
-      cameraInstance?.stop();
-      poseInstance?.close();
+      try {
+        if (videoElement.srcObject) {
+          videoElement.srcObject.getTracks().forEach(track => track.stop());
+        }
+        poseInstance?.close();
+      } catch (e) {
+        console.error('Error closing camera/pose:', e);
+      }
     };
   }, [mediapipeLoaded]);
 
